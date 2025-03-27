@@ -8,6 +8,16 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import readline from 'readline/promises';
 // 引入 dotenv 库，用于加载环境变量
 import dotenv from 'dotenv';
+import express from 'express';
+const app = express();
+app.use(express.json());
+const PORT = 3000;
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', 'http://localhost:8000');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type'); // Allow Content-Type
+  next();
+});
 
 // 加载环境变量
 dotenv.config();
@@ -23,9 +33,9 @@ if (!LLM_API_KEY) {
 // 定义 MCPClient 类
 class MCPClient {
   // 定义私有属性 mcp，类型为 Client
-  private mcp: Client;
+  mcp: Client;
   // 定义私有属性 openai，类型为 OpenAI
-  private openai: OpenAI;
+  openai: OpenAI;
   // 定义私有属性 transport，类型为 StdioClientTransport 或 null，初始值为 null
   private transport: StdioClientTransport | null = null;
   // 定义私有属性 tools，类型为数组，初始值为空数组
@@ -94,6 +104,21 @@ class MCPClient {
       // 抛出错误
       throw e;
     }
+  }
+  async sendQuery(query: string) {
+    // 初始化消息数组
+    const messages: OpenAI.ChatCompletionMessageParam[] = [
+      {
+        role: 'user',
+        content: query,
+      },
+    ];
+    return this.openai.chat.completions.create({
+      model: LLM_MODEL!,
+      max_tokens: 1000,
+      messages,
+      tools: this.tools,
+    });
   }
   // 处理查询的方法
   async processQuery(query: string) {
@@ -219,18 +244,228 @@ async function main() {
   }
   // 创建 MCPClient 实例
   const mcpClient = new MCPClient();
-  try {
-    // 连接到服务器
-    await mcpClient.connectToServer(process.argv[2]);
-    // 启动聊天循环
-    await mcpClient.chatLoop();
-  } finally {
-    // 清理资源
-    await mcpClient.cleanup();
-    // 退出进程
-    process.exit(0);
-  }
+  // 连接到服务器
+  await mcpClient.connectToServer(process.argv[2]);
+
+  app.post('/sse', async (req, res) => {
+    // 设置 SSE 相关头部
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*'); // 允许跨域
+
+    try {
+      const query = req.body?.query;
+      const runId = query + `-${Date.now()}`;
+
+      // 将工具调用信息添加到最终文本数组
+      res.write(
+        `data: ${JSON.stringify({
+          chat_result: null,
+          process_status: 'PROC_WHITEBOX',
+          stream: null,
+          white_box_process: [
+            {
+              category: 'DeepThink',
+              info: `正在进行意图识别`,
+              input: {
+                query,
+              },
+              runId,
+              output: { data: '识别中。。。', type: 'TOKEN' },
+            },
+          ],
+        })}\n\n`,
+      );
+
+      // 调用 OpenAI 的聊天完成接口
+      const response = await mcpClient.sendQuery(query);
+      const messages = [
+        {
+          role: 'user',
+          content: query,
+        },
+      ];
+
+      for (const choice of response.choices) {
+        // 如果没有工具调用
+        if (
+          !choice.message.tool_calls ||
+          choice.message.tool_calls.length === 0
+        ) {
+          res.write(
+            `data: ${JSON.stringify({
+              chat_result: null,
+              process_status: 'PROC_WHITEBOX',
+              stream: null,
+              white_box_process: [
+                {
+                  category: 'DeepThink',
+                  info: `正在进行意图识别`,
+                  input: {
+                    query,
+                  },
+                  runId,
+                  output: {
+                    data: '\n 无需使用工具，直接输出',
+                    type: 'Token',
+                  },
+                },
+              ],
+            })}\n\n`,
+          );
+          res.write(
+            `data: ${JSON.stringify({
+              chat_result: null,
+              process_status: 'PROC_WHITEBOX',
+              stream: null,
+              white_box_process: [
+                {
+                  category: 'DeepThink',
+                  info: `正在进行意图识别`,
+                  input: {
+                    query,
+                  },
+                  runId,
+                  output: {
+                    data: '',
+                    type: 'END',
+                  },
+                },
+              ],
+            })}\n\n`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          // 将消息内容添加到最终文本数组
+          res.write(`data: ${JSON.stringify(choice.message)}\n\n`);
+        } else {
+          // 获取工具名称
+          const toolName = choice.message.tool_calls[0].function.name;
+
+          // 将工具调用信息添加到最终文本数组
+          res.write(
+            `data: ${JSON.stringify({
+              chat_result: null,
+              process_status: 'PROC_WHITEBOX',
+              stream: null,
+              white_box_process: [
+                {
+                  category: 'DeepThink',
+                  info: `正在查找调用的工具`,
+                  input: {
+                    inputArgs: {
+                      query,
+                    },
+                  },
+                  runId,
+                  output: {
+                    data: '\n 根据用户的输入，选择了' + toolName + '工具',
+                    type: 'Token',
+                  },
+                },
+              ],
+            })}\n\n`,
+          );
+          // 获取工具参数
+          const toolArgs = JSON.parse(
+            choice.message.tool_calls[0].function.arguments,
+          );
+
+          const toolID = toolName + `-${Date.now()}`;
+          res.write(
+            `data: ${JSON.stringify({
+              chat_result: null,
+              process_status: 'PROC_WHITEBOX',
+              stream: null,
+              white_box_process: [
+                {
+                  category: 'ToolCall',
+                  info: `Calling tool ${toolName}`,
+                  input: {
+                    inputArgs: toolArgs,
+                  },
+                  runId: toolID,
+                },
+              ],
+            })}\n\n`,
+          );
+          // 调用工具
+          const result = await mcpClient.mcp.callTool({
+            name: toolName,
+            arguments: toolArgs,
+          });
+
+          // 将工具调用信息添加到最终文本数组
+          res.write(
+            `data: ${JSON.stringify({
+              chat_result: null,
+              process_status: 'PROC_WHITEBOX',
+              stream: null,
+              white_box_process: [
+                {
+                  category: 'ToolCall',
+                  info: `Calling tool ${toolName}`,
+                  input: {
+                    toolArgs,
+                  },
+                  runId: toolID,
+                  output: {
+                    response: result.content,
+                  },
+                },
+              ],
+            })}\n\n`,
+          );
+
+          // 将工具调用结果添加到消息数组
+          messages.push({
+            role: 'user',
+            content: result.content as string,
+          });
+
+          // 再次调用 OpenAI 的聊天完成接口
+          const response = await mcpClient.openai.chat.completions.create({
+            model: LLM_MODEL!,
+            max_tokens: 1000,
+            messages: messages as any,
+            stream: true,
+          });
+          for await (const chunk of response) {
+            res.write(
+              `data: ${JSON.stringify({
+                content: chunk?.choices?.at(0)?.delta?.content,
+              })}\n\n`,
+            );
+          }
+        }
+      }
+
+      // for await (const chunk of response) {
+      //   res.write(`data: ${JSON.stringify(chunk?.choices?.at(0))}\n\n`);
+      // }
+    } catch (error) {
+    } finally {
+      res.end();
+    }
+
+    // 客户端断开连接时清理
+    req.on('close', () => {
+      res.end();
+      console.log('Client disconnected');
+    });
+  });
+  app.options('/sse', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*'); // 允许跨域
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS'); // 允许 POST 和 OPTIONS 请求
+    res.end();
+  });
+
+  // // 启动聊天循环
+  // await mcpClient.chatLoop();
 }
 
 // 调用主函数
 main();
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
